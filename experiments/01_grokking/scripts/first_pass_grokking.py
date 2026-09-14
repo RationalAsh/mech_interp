@@ -15,14 +15,15 @@ import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
+from tqdm.auto import tqdm
 
 
-REQUIRED_PACKAGES = ["torch", "matplotlib", "numpy"]
+REQUIRED_PACKAGES = ["torch", "matplotlib", "numpy", "tqdm"]
 missing_packages = [name for name in REQUIRED_PACKAGES if importlib.util.find_spec(name) is None]
 if missing_packages:
     missing_display = ", ".join(missing_packages)
     raise RuntimeError(
-        f"Missing packages: {missing_display}. Install them with `uv add torch matplotlib`."
+        f"Missing packages: {missing_display}. Install them with `uv add torch matplotlib numpy tqdm`."
     )
 
 
@@ -369,7 +370,8 @@ def train_experiment(
     history: list[dict[str, float]] = []
     loader_iter = iter(train_loader)
 
-    for step in range(1, config.max_steps + 1):
+    progress = tqdm(range(1, config.max_steps + 1), desc="training", unit="step")
+    for step in progress:
         try:
             tokens, targets = next(loader_iter)
         except StopIteration:
@@ -387,18 +389,23 @@ def train_experiment(
         optimizer.step()
         scheduler.step()
 
+        metrics = None
         if step == 1 or step % config.eval_every == 0 or step == config.max_steps:
             train_metrics = evaluate_model(model, train_dataset)
             val_metrics = evaluate_model(model, val_dataset)
-            history.append(
-                {
-                    "step": float(step),
-                    "train_loss": train_metrics["loss"],
-                    "train_accuracy": train_metrics["accuracy"],
-                    "val_loss": val_metrics["loss"],
-                    "val_accuracy": val_metrics["accuracy"],
-                }
-            )
+            metrics = {
+                "step": float(step),
+                "train_loss": train_metrics["loss"],
+                "train_accuracy": train_metrics["accuracy"],
+                "val_loss": val_metrics["loss"],
+                "val_accuracy": val_metrics["accuracy"],
+            }
+            history.append(metrics)
+
+        progress.set_postfix(
+            loss=f"{loss.item():.4f}",
+            val_acc=(f"{metrics['val_accuracy']:.3f}" if metrics is not None else "-"),
+        )
 
     return history, model
 
