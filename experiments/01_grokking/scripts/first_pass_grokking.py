@@ -11,12 +11,13 @@ from typing import Callable
 
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
+import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 
-REQUIRED_PACKAGES = ["torch", "matplotlib"]
+REQUIRED_PACKAGES = ["torch", "matplotlib", "numpy"]
 missing_packages = [name for name in REQUIRED_PACKAGES if importlib.util.find_spec(name) is None]
 if missing_packages:
     missing_display = ", ".join(missing_packages)
@@ -61,8 +62,8 @@ class ExperimentConfig:
     lr: float = 1e-3
     weight_decay: float = 0.0
     warmup_steps: int = 10
-    max_steps: int = 40_000
-    eval_every: int = 250
+    max_steps: int = 1_000_000
+    eval_every: int = 1_000
 
 
 OPERATIONS: dict[str, Callable[[int, int, int], int]] = {
@@ -83,6 +84,25 @@ OP_SYMBOLS = {
 
 BASE_CONFIG = ExperimentConfig()
 
+# The released paper code used one vocabulary shared by every task in the
+# paper, including S5. Keeping that output dimension is important: using only
+# the 97 answer classes makes the optimization problem noticeably easier.
+PAPER_OPERATORS = sorted(
+    [
+        "+", "-", "*", "/", "**2+", "**3+", "+*", "+-",
+        "(x._value//y)if(y._value%2==1)else(x-y)_mod_97",
+        "copy", "reverse", "s5", "s5aba", "s5conj", "sort",
+        "x**2+y**2_mod_97", "x**2+y**2+x*y_mod_97",
+        "x**2+y**2+x*y+x_mod_97", "x**3+x*y_mod_97",
+        "x**3+x*y**2+y_mod_97",
+    ]
+)
+PAPER_VOCAB_SIZE = 2 + len(PAPER_OPERATORS) + 97 + math.factorial(5)
+PAPER_EOS_TOKEN = 0
+PAPER_EQ_TOKEN = 1
+PAPER_OPERATOR_TOKEN = 2 + PAPER_OPERATORS.index("/")
+PAPER_NUMBER_OFFSET = 2 + len(PAPER_OPERATORS)
+
 
 def build_modular_dataset(config: ExperimentConfig) -> tuple[torch.Tensor, torch.Tensor]:
     if config.operation not in OPERATIONS:
@@ -102,6 +122,42 @@ def build_modular_dataset(config: ExperimentConfig) -> tuple[torch.Tensor, torch
             targets.append(target)
 
     return torch.tensor(inputs, dtype=torch.long), torch.tensor(targets, dtype=torch.long)
+
+
+def build_figure1_dataset(config: ExperimentConfig) -> tuple[torch.Tensor, torch.Tensor]:
+    """Tokenize division exactly like the authors' released implementation.
+
+    Input is ``<eos> x / y = answer`` and the two supervised next-token
+    targets are ``answer <eos>``. The paper describes this as calculating loss
+    only on the answer (right-hand-side) portion of the equation.
+    """
+    if config.prime != 97 or config.operation != "div":
+        raise ValueError("The Figure 1 tokenizer is defined for division mod 97")
+
+    inputs: list[list[int]] = []
+    targets: list[list[int]] = []
+    for x in range(97):
+        for y in range(1, 97):
+            answer = OPERATIONS["div"](x, y, 97)
+            inputs.append(
+                [
+                    PAPER_EOS_TOKEN,
+                    PAPER_NUMBER_OFFSET + x,
+                    PAPER_OPERATOR_TOKEN,
+                    PAPER_NUMBER_OFFSET + y,
+                    PAPER_EQ_TOKEN,
+                    PAPER_NUMBER_OFFSET + answer,
+                ]
+            )
+            targets.append([PAPER_NUMBER_OFFSET + answer, PAPER_EOS_TOKEN])
+
+    # ArithmeticDataset.make_data(..., seed=0) performs this shuffle before
+    # taking the first train_fraction of equations.
+    permutation = np.random.RandomState(seed=0).permutation(len(inputs))
+    return (
+        torch.tensor(np.asarray(inputs)[permutation], dtype=torch.long),
+        torch.tensor(np.asarray(targets)[permutation], dtype=torch.long),
+    )
 
 
 def split_dataset(
@@ -182,6 +238,62 @@ class GrokkingTransformer(nn.Module):
         return self.output(hidden)
 
 
+class PaperTransformer(nn.Module):
+    """The post-norm decoder architecture in the authors' released code."""
+
+    def __init__(self, config: ExperimentConfig) -> None:
+        super().__init__()
+        self.embedding = nn.Embedding(PAPER_VOCAB_SIZE, config.d_model)
+        positions = torch.arange(6, dtype=torch.float32).unsqueeze(1)
+        dimensions = torch.arange(0, config.d_model, 2, dtype=torch.float32)
+        angles = positions / (10000 ** (dimensions / config.d_model))
+        position_encoding = torch.empty(6, config.d_model)
+        position_encoding[:, 0::2] = torch.sin(angles)
+        position_encoding[:, 1::2] = torch.cos(angles)
+        self.register_buffer("position_encoding", position_encoding, persistent=False)
+        self.blocks = nn.ModuleList(
+            [PaperDecoderBlock(config.d_model, config.n_heads, config.mlp_mult) for _ in range(config.n_layers)]
+        )
+        self.output = nn.Linear(config.d_model, PAPER_VOCAB_SIZE, bias=False)
+        self.register_buffer("causal_mask", torch.ones(6, 6, dtype=torch.bool).tril(), persistent=False)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        hidden = self.embedding(tokens) + self.position_encoding[: tokens.size(1)]
+        mask = self.causal_mask[: tokens.size(1), : tokens.size(1)]
+        for block in self.blocks:
+            hidden = block(hidden, mask)
+        # Predict answer after '=' and EOS after the answer, matching y_rhs.
+        return self.output(hidden[:, -2:, :])
+
+
+class PaperDecoderBlock(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, mlp_mult: int) -> None:
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.q = nn.ModuleList([nn.Linear(d_model, self.d_head, bias=False) for _ in range(n_heads)])
+        self.k = nn.ModuleList([nn.Linear(d_model, self.d_head, bias=False) for _ in range(n_heads)])
+        self.v = nn.ModuleList([nn.Linear(d_model, self.d_head, bias=False) for _ in range(n_heads)])
+        self.attn_out = nn.Linear(d_model, d_model, bias=False)
+        self.attn_norm = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, mlp_mult * d_model, bias=False),
+            nn.ReLU(),
+            nn.Linear(mlp_mult * d_model, d_model, bias=False),
+        )
+        self.mlp_norm = nn.LayerNorm(d_model)
+
+    def forward(self, hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        heads = []
+        for q_proj, k_proj, v_proj in zip(self.q, self.k, self.v):
+            q, k, v = q_proj(hidden), k_proj(hidden), v_proj(hidden)
+            scores = q @ k.transpose(-2, -1) / math.sqrt(self.d_head)
+            scores = scores.masked_fill(~mask, float("-inf"))
+            heads.append(torch.softmax(scores, dim=-1) @ v)
+        hidden = self.attn_norm(hidden + self.attn_out(torch.cat(heads, dim=-1)))
+        return self.mlp_norm(hidden + self.mlp(hidden))
+
+
 @torch.no_grad()
 def evaluate_model(model: nn.Module, dataset: TensorDataset) -> dict[str, float]:
     model.eval()
@@ -198,10 +310,16 @@ def evaluate_model(model: nn.Module, dataset: TensorDataset) -> dict[str, float]
         targets = targets.to(DEVICE)
 
         logits = model(tokens)
-        loss = loss_fn(logits, targets)
+        loss = loss_fn(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
 
         total_loss += float(loss.item()) * targets.size(0)
-        total_correct += int((logits.argmax(dim=-1) == targets).sum().item())
+        predictions = logits.argmax(dim=-1)
+        if targets.ndim == 2:
+            # Reference metric: an equation is correct only when every RHS
+            # token (the answer and trailing EOS) is correct.
+            total_correct += int((predictions == targets).all(dim=-1).sum().item())
+        else:
+            total_correct += int((predictions == targets).sum().item())
         total_examples += targets.size(0)
 
     return {
@@ -210,22 +328,39 @@ def evaluate_model(model: nn.Module, dataset: TensorDataset) -> dict[str, float]
     }
 
 
-def train_experiment(config: ExperimentConfig) -> tuple[list[dict[str, float]], GrokkingTransformer]:
+def train_experiment(
+    config: ExperimentConfig,
+    *,
+    paper_figure1: bool = False,
+) -> tuple[list[dict[str, float]], nn.Module]:
     seed_everything(config.model_seed)
 
-    train_dataset, val_dataset, train_loader = make_datasets_and_loader(config)
-    model = GrokkingTransformer(config).to(DEVICE)
+    if paper_figure1:
+        inputs, targets = build_figure1_dataset(config)
+        split_index = round(config.train_fraction * len(inputs))
+        train_dataset = TensorDataset(inputs[:split_index], targets[:split_index])
+        val_dataset = TensorDataset(inputs[split_index:], targets[split_index:])
+        batch_size = min(config.batch_size, math.ceil(len(train_dataset) / 2))
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        model: nn.Module = PaperTransformer(config).to(DEVICE)
+    else:
+        train_dataset, val_dataset, train_loader = make_datasets_and_loader(config)
+        model = GrokkingTransformer(config).to(DEVICE)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=config.lr,
+        # The released implementation uses base lr=1 and has LambdaLR return
+        # the absolute learning rate. Preserve that detail for Figure 1.
+        lr=1.0 if paper_figure1 else config.lr,
         betas=(0.9, 0.98),
         weight_decay=config.weight_decay,
     )
 
     def lr_multiplier(step: int) -> float:
         if config.warmup_steps <= 0:
-            return 1.0
+            return config.lr if paper_figure1 else 1.0
+        if paper_figure1:
+            return min(step / config.warmup_steps, 1.0) * config.lr
         return min((step + 1) / config.warmup_steps, 1.0)
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_multiplier)
@@ -247,7 +382,7 @@ def train_experiment(config: ExperimentConfig) -> tuple[list[dict[str, float]], 
 
         optimizer.zero_grad(set_to_none=True)
         logits = model(tokens)
-        loss = loss_fn(logits, targets)
+        loss = loss_fn(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
         loss.backward()
         optimizer.step()
         scheduler.step()
@@ -266,6 +401,39 @@ def train_experiment(config: ExperimentConfig) -> tuple[list[dict[str, float]], 
             )
 
     return history, model
+
+
+def plot_figure1_left(histories: list[list[dict[str, float]]]) -> Figure:
+    fig, axis = plt.subplots(figsize=(6.4, 4.1))
+    max_step = 1
+    for seed_index, history in enumerate(histories):
+        steps = [int(row["step"]) for row in history]
+        max_step = max(max_step, max(steps))
+        axis.plot(
+            steps,
+            [100 * row["train_accuracy"] for row in history],
+            color="#ff0000",
+            alpha=0.7,
+            linewidth=1,
+            label="train" if seed_index == 0 else None,
+        )
+        axis.plot(
+            steps,
+            [100 * row["val_accuracy"] for row in history],
+            color="#008000",
+            alpha=0.7,
+            linewidth=1,
+            label="val" if seed_index == 0 else None,
+        )
+    axis.set_xscale("log")
+    axis.set_xlim(5, max_step)
+    axis.set_ylim(-2, 102)
+    axis.set_title("Modular Division (training on 50% of data)", fontsize=10)
+    axis.set_xlabel("Optimization Steps")
+    axis.set_ylabel("Accuracy")
+    axis.legend()
+    fig.tight_layout()
+    return fig
 
 
 def first_step_at_accuracy(
@@ -457,13 +625,17 @@ def run_delayed_generalization(output_dir: Path | None, show_plots: bool, steps:
         operation="div",
         train_fraction=0.5,
         weight_decay=0.0,
-        max_steps=steps or 30_000,
-        eval_every=250,
+        max_steps=steps or 1_000_000,
+        eval_every=1_000,
     )
-    history, _ = train_experiment(config)
-    summarize_run(history, "Delayed generalization: modular division")
-    fig = plot_training_curves(history, "Delayed generalization")
-    save_or_show_figure(fig, "delayed_generalization", output_dir, show_plots)
+    histories = []
+    for model_seed in range(3):
+        seeded_config = replace(config, model_seed=model_seed)
+        history, _ = train_experiment(seeded_config, paper_figure1=True)
+        histories.append(history)
+        summarize_run(history, f"Figure 1 left: seed {model_seed}")
+    fig = plot_figure1_left(histories)
+    save_or_show_figure(fig, "figure_1_left", output_dir, show_plots)
 
 
 def run_weight_decay_mode(output_dir: Path | None, show_plots: bool, steps: int | None) -> None:
