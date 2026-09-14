@@ -1,0 +1,17 @@
+[project]
+name = "mech-interp"
+version = "0.1.0"
+description = "Step-by-step mechanistic interpretability research and reproductions"
+readme = "README.md"
+authors = [
+    { name = "Ashwin Narayan", email = "ashwinnarayan1994@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+mech-interp = "mech_interp:main"
+
+[build-system]
+requires = ["uv_build>=0.9.7,<0.10.0"]
+build-backend = "uv_build"
