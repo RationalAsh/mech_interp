@@ -11,6 +11,7 @@ dependencies = [
     "matplotlib>=3.11.2",
     "numpy>=2.5.3",
     "torch>=2.14.0",
+    "tornado<6.5.9",
     "tqdm>=4.67.1",
 ]
 
@@ -20,3 +21,8 @@ mech-interp = "mech_interp:main"
 [build-system]
 requires = ["uv_build>=0.9.7,<0.10.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+]
