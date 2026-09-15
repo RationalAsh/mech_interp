@@ -11,3 +11,5 @@ data/*
 !data/README.md
 artifacts/*
 !artifacts/README.md
+
+*.chat
