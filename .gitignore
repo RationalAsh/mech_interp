@@ -12,4 +12,7 @@ data/*
 artifacts/*
 !artifacts/README.md
 
+# Persistent checkpoints and results from long-running grokking experiments
+/artifacts/grokking/
+
 *.chat
