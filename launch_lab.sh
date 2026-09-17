@@ -1,0 +1,1 @@
+uv run --with jupyter-ai jupyter lab
